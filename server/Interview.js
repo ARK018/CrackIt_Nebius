@@ -54,7 +54,7 @@ async function getAIResponse(message, conversationHistory, interview) {
       {
         role: "system",
         content: `You are TESS an AI interviewer conducting an interview for the role of ${interview.title}. 
-        Your primary objective is to assess the candidate's (role:'user') qualifications, skills, and experiences strictly related to the ${interview.title} role. 
+        Your primary objective is to assess the candidate's qualifications, skills, and experiences strictly related to the ${interview.title} role. 
         Ask only questions that are directly relevant to the job responsibilities, required qualifications, and technical or behavioral competencies necessary for this position. 
         Here's the job description for reference: ${interview.description}.
         
@@ -105,50 +105,28 @@ async function textToSpeech(text, socket) {
     // Create a Deepgram client
     const deepgram = createClient(DEEPGRAM_API_KEY);
 
-    // Improved text splitting - combine into larger meaningful chunks
-    // Split first into major sentence breaks
-    const rawSentences = text.split(/(?<=[.!?])\s+|(?<=[.!?])$/);
-    const sentences = rawSentences
-      .filter((s) => s.trim().length > 0)
-      .map((s) => s.trim());
-
+    // Split long text into smaller sentences for faster processing
+    const sentences = splitIntoSentences(text);
     console.log(
       `Split text into ${sentences.length} chunks for faster TTS processing`
     );
 
-    // Optimize chunks - aim for larger chunks to reduce API calls
-    // Target chunk size of 150-250 characters for better performance
-    const optimizedChunks = [];
-    let currentChunk = "";
-    const TARGET_LENGTH = 200;
+    // Don't split into too many tiny chunks - combine very short sentences
+    const combinedSentences = combineShortSentences(sentences);
+    console.log(`Optimized into ${combinedSentences.length} processing chunks`);
 
-    for (const sentence of sentences) {
-      if (currentChunk.length + sentence.length <= TARGET_LENGTH) {
-        currentChunk += (currentChunk ? " " : "") + sentence;
-      } else {
-        if (currentChunk) optimizedChunks.push(currentChunk);
-        currentChunk = sentence;
-      }
-    }
-    if (currentChunk) optimizedChunks.push(currentChunk);
-
-    console.log(`Optimized into ${optimizedChunks.length} processing chunks`);
-
-    // Track processed chunks to handle completion correctly
-    const processedChunks = new Set();
-    const totalChunks = optimizedChunks.length;
-
-    // Process chunks sequentially for more predictable performance
-    for (let i = 0; i < optimizedChunks.length; i++) {
-      const chunk = optimizedChunks[i];
-      if (!chunk.trim()) continue;
-
-      console.log(`Processing chunk ${i}: "${chunk.substring(0, 30)}..."`);
+    // Process each sentence in parallel for faster response
+    const processSentence = async (sentence, index) => {
+      if (!sentence.trim()) return;
 
       try {
+        console.log(
+          `Processing sentence ${index}: "${sentence.substring(0, 30)}..."`
+        );
+
         // Make a request to generate speech
         const response = await deepgram.speak.request(
-          { text: chunk },
+          { text: sentence },
           {
             model: "aura-asteria-en",
             encoding: "linear16",
@@ -162,31 +140,46 @@ async function textToSpeech(text, socket) {
           // Convert stream to buffer
           const audioBuffer = await getAudioBuffer(stream);
           console.log(
-            `Generated audio for chunk ${i}, buffer size: ${audioBuffer.length} bytes`
+            `Generated audio for chunk ${index}, buffer size: ${audioBuffer.length} bytes`
           );
 
           // Send the chunk to the client with its sequence number
           socket.emit("tts-chunk", {
             audio: audioBuffer,
-            index: i,
-            isLast: false,
+            index: index, // Include position to maintain order
+            isLast: index === combinedSentences.length - 1,
           });
 
-          console.log(`Sent TTS chunk ${i + 1}/${totalChunks}`);
+          console.log(
+            `Sent TTS chunk ${index + 1}/${combinedSentences.length}`
+          );
 
-          // Track completion
-          processedChunks.add(i);
-
-          // Send completion signal when all chunks are done
-          if (processedChunks.size === totalChunks) {
+          // If this is the last chunk, send completion event
+          if (index === combinedSentences.length - 1) {
             socket.emit("tts-complete");
-            console.log("All TTS chunks processed and sent");
+            console.log("Sent TTS complete signal");
           }
+        } else {
+          console.error(`No stream returned for chunk ${index}`);
         }
       } catch (error) {
-        console.error(`Error processing chunk ${i}:`, error);
-        processedChunks.add(i);
+        console.error(`Error processing sentence ${index}:`, error);
       }
+    };
+
+    // Process all sentences in parallel with controlled concurrency
+    const CONCURRENCY = 2; // Process this many sentences at once (reduced from 3)
+    for (let i = 0; i < combinedSentences.length; i += CONCURRENCY) {
+      const batch = combinedSentences.slice(i, i + CONCURRENCY);
+      console.log(
+        `Processing batch of ${batch.length} sentences, starting at index ${i}`
+      );
+
+      await Promise.all(
+        batch.map((sentence, batchIndex) =>
+          processSentence(sentence, i + batchIndex)
+        )
+      );
     }
   } catch (error) {
     console.error("Error with text-to-speech:", error);
